@@ -1,0 +1,14 @@
+python-telegram-bot
+SQLAlchemy
+psycopg[binary]
+pandas
+numpy
+statsmodels
+scikit-learn
+feedparser
+beautifulsoup4
+httpx
+tenacity
+python-dateutil
+robotexclusionrulesparser
+uvloop; platform_system != 'Windows'
