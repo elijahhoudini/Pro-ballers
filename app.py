@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 # pip install:
 # python-telegram-bot, SQLAlchemy, psycopg[binary], pandas, numpy, statsmodels, scikit-learn,
 # feedparser, beautifulsoup4, cloudscraper, tenacity, python-dateutil, robotexclusionrulesparser, uvloop (non-windows)
-from pydantic import BaseModel
+from dataclasses import dataclass
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 import numpy as np
@@ -22,11 +22,9 @@ from bs4 import BeautifulSoup
 from dateutil import parser as dtp
 
 # ---------- Settings ----------
-class Settings(BaseModel):
-    telegram_token: str = os.getenv(
-        "TELEGRAM_BOT_TOKEN",
-        "8355867886:AAGtV1075TBOraHtghFVQGXaEQtlclXCXCg",
-    )
+@dataclass
+class Settings:
+    telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     # Fall back to a local SQLite file so the project can run without any
     # external database configuration.  An environment variable can still be
     # provided to point at a PostgreSQL instance, but it is no longer
@@ -159,8 +157,20 @@ def run_migrations():
             sql = MIGRATIONS[name]
             if not sql.strip():
                 continue
+            if engine.dialect.name == "sqlite":
+                sql = (
+                    sql.replace("SERIAL", "INTEGER")
+                       .replace("BIGSERIAL", "INTEGER")
+                       .replace("TIMESTAMPTZ", "TIMESTAMP")
+                       .replace("JSONB", "TEXT")
+                       .replace("TEXT[]", "TEXT")
+                       .replace("ARRAY[]::TEXT[]", "''")
+                       .replace("now()", "CURRENT_TIMESTAMP")
+                       .replace("NOW()", "CURRENT_TIMESTAMP")
+                )
             print(f"Applying migration: {name}")
-            conn.execute(text(sql))
+            for stmt in filter(None, (s.strip() for s in sql.split(";"))):
+                conn.exec_driver_sql(stmt)
     print("All migrations applied.")
 
 # ---------- Helpers: odds math ----------
@@ -227,9 +237,10 @@ def parse_nfl_injuries():
                 continue
             team = tds[0]
             status = tds[4] if len(tds) > 4 else None
-            s.execute(text("""
+            now_expr = "NOW()" if engine.dialect.name != "sqlite" else "CURRENT_TIMESTAMP"
+            s.execute(text(f"""
                 INSERT INTO injuries_2025(player_id, team, status, report_time, source, url)
-                VALUES (NULL, :team, :status, NOW(), 'nfl.com', :url)
+                VALUES (NULL, :team, :status, {now_expr}, 'nfl.com', :url)
             """), {"team": team, "status": status, "url": NFL_INJURIES_URL})
             inserted += 1
         s.commit()
@@ -249,16 +260,17 @@ def parse_nfl_news():
             href = a.get("href", "")
             url = href if href.startswith("http") else f"https://www.nfl.com{href}"
             title = a.get_text(strip=True)[:300]
-            time_el = a.find("time") or soup.find("time")
+            time_el = a.find("time")
             when = None
             if time_el and (time_el.get("datetime") or (time_el.text or "").strip()):
                 try:
                     when = dtp.parse(time_el.get("datetime") or time_el.text.strip())
                 except Exception:
                     when = None
-            s.execute(text("""
+            tags_expr = "ARRAY[]::TEXT[]" if engine.dialect.name != "sqlite" else "''"
+            s.execute(text(f"""
                 INSERT INTO news_2025(published_at, title, url, source, tags)
-                VALUES (:t,:title,:url,'nfl.com', ARRAY[]::TEXT[])
+                VALUES (:t,:title,:url,'nfl.com',{tags_expr})
                 ON CONFLICT DO NOTHING
             """), {"t": when, "title": title, "url": url})
             inserted += 1
@@ -296,8 +308,9 @@ def build_features():
 
 # ---------- Model + Predictions ----------
 def train_and_predict():
-    # For each prop (line you text in), compute mu/sd from prior 2025 games for that market,
-    # simulate outcomes, and store hit probabilities. If insufficient history, skip (no fakery).
+    # For each prop (line you text in), compute mu/sd from prior 2025 games for that market
+    # and use a normal approximation to derive hit probabilities. If insufficient history,
+    # skip (no fakery).
     with SessionLocal() as s:
         targets = s.execute(text("""
             SELECT pr.player_id, pr.game_id, pr.market, pr.line, pr.price, pr.id
@@ -327,14 +340,16 @@ def train_and_predict():
                 # Not enough 2025-only prior data to responsibly predict
                 continue
 
-            sims = np.random.normal(mu, sd, size=20000)
-            over_p = float((sims > float(line)).mean())
-            under_p = 1.0 - over_p
+            cdf = 0.5 * (1 + math.erf((float(line) - mu) / (sd * math.sqrt(2))))
+            over_p = 1.0 - cdf
+            under_p = cdf
+            ev_o = ev_win_prob(over_p, int(price))
+            ev_u = ev_win_prob(under_p, int(price))
 
             s.execute(text("""
                 INSERT INTO predictions_2025(player_id, game_id, market, mean, sd, over_p, under_p, ev_over, ev_under, model_version)
-                VALUES (:pid,:gid,:m,:mu,:sd,:po,:pu, NULL, NULL, 'baseline-2025-v1')
-            """), {"pid": pid, "gid": gid, "m": market, "mu": mu, "sd": sd, "po": over_p, "pu": under_p})
+                VALUES (:pid,:gid,:m,:mu,:sd,:po,:pu,:evo,:evu,'baseline-2025-v1')
+            """), {"pid": pid, "gid": gid, "m": market, "mu": mu, "sd": sd, "po": over_p, "pu": under_p, "evo": ev_o, "evu": ev_u})
         s.commit()
 
 # ---------- Recommendations ----------
