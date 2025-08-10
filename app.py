@@ -6,13 +6,13 @@ from typing import Any, Dict, List, Optional
 # pip install:
 # python-telegram-bot, SQLAlchemy, psycopg[binary], pandas, numpy, statsmodels, scikit-learn,
 # feedparser, beautifulsoup4, cloudscraper, tenacity, python-dateutil, robotexclusionrulesparser, uvloop (non-windows)
-from dataclasses import dataclass
+from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 import numpy as np
 
 # Telegram
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram import Update
 
 # Collectors deps
@@ -22,30 +22,23 @@ from bs4 import BeautifulSoup
 from dateutil import parser as dtp
 
 # ---------- Settings ----------
-@dataclass
-class Settings:
+class Settings(BaseModel):
     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    # Fall back to a local SQLite file so the project can run without any
-    # external database configuration.  An environment variable can still be
-    # provided to point at a PostgreSQL instance, but it is no longer
-    # required.
-    database_url: str = os.getenv(
-        "DATABASE_URL",
-        f"sqlite:///{os.path.abspath('proballers.db')}",
-    )
+    database_url: str = os.getenv("DATABASE_URL", "")  # may be empty
     app_env: str = os.getenv("APP_ENV", "dev")
 
 settings = Settings()
 # Single shared session to bypass Cloudflare-protected sites when gathering data.
 scraper = cloudscraper.create_scraper()
-if settings.database_url.startswith("sqlite:///"):
-    print(
-        f"Using local SQLite database at {settings.database_url.split('///', 1)[1]}",
-        file=sys.stderr,
-    )
+
+# Default to a local SQLite database if none provided
+default_sqlite_url = "sqlite+pysqlite:///data.db"
+db_url = settings.database_url or default_sqlite_url
+if db_url.startswith("sqlite"):
+    print(f"Using local SQLite database at {db_url.split('///', 1)[1]}", file=sys.stderr)
 
 # ---------- DB ----------
-engine = create_engine(settings.database_url, pool_pre_ping=True, future=True)
+engine = create_engine(db_url, pool_pre_ping=True, future=True)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
 
 # ---------- SQL Migrations (embedded) ----------
@@ -647,6 +640,49 @@ async def refresh_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Refresh failed: {e}")
 
+async def player_message(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    """Handle plain text messages with a player name and return recent stats."""
+    name = (update.message.text or "").strip()
+    if not name:
+        return
+    with SessionLocal() as s:
+        row = s.execute(
+            text("SELECT player_id, name FROM players WHERE LOWER(name)=LOWER(:n)"),
+            {"n": name},
+        ).fetchone()
+        if not row:
+            await update.message.reply_text(
+                "Player not found. Use /addplayer Name | TEAM | POS first."
+            )
+            return
+        pid = row[0]
+        stat = s.execute(
+            text(
+                """
+                SELECT g.week, g.season_type, s.stats
+                FROM player_game_stats_2025 s
+                JOIN games_2025 g ON g.game_id = s.game_id
+                WHERE s.player_id = :pid
+                ORDER BY g.week DESC
+                LIMIT 1
+                """
+            ),
+            {"pid": pid},
+        ).fetchone()
+    if not stat:
+        await update.message.reply_text(f"No stats found for {name}.")
+        return
+    week, stype, stats_json = stat
+    if isinstance(stats_json, str):
+        try:
+            stats_json = json.loads(stats_json)
+        except Exception:
+            pass
+    stats_text = json.dumps(stats_json, indent=2, sort_keys=True)
+    await update.message.reply_text(
+        f"📊 {name} — W{week} {stype[:3].upper()} stats:\n{stats_text}"
+    )
+
 async def build_app(token: str):
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
@@ -660,25 +696,27 @@ async def build_app(token: str):
     app.add_handler(CommandHandler("addplayer", addplayer))
     app.add_handler(CommandHandler("line", line_cmd))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
+    # Allow plain-text messages with just a player name
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), player_message))
     return app
 
 # ---------- Entrypoint ----------
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python app.py [migrate|bot|refresh]")
-        sys.exit(1)
-    cmd = sys.argv[1].lower()
+    cmd = sys.argv[1].lower() if len(sys.argv) > 1 else "bot"
 
     if cmd == "migrate":
         run_migrations()
         return
 
     if cmd == "refresh":
+        run_migrations()  # ensure tables exist
         n = refresh_all()
         print(f"Refresh complete. {n} recommendations updated.")
         return
 
     if cmd == "bot":
+        # Auto-migrate every start (safe for CREATE IF NOT EXISTS)
+        run_migrations()
         if not settings.telegram_token:
             raise RuntimeError("Set TELEGRAM_BOT_TOKEN before running the bot.")
         async def runner():
@@ -689,8 +727,7 @@ def main():
             await app.idle()
         if os.name != "nt":
             try:
-                import uvloop
-                uvloop.install()
+                import uvloop; uvloop.install()
             except Exception:
                 pass
         asyncio.run(runner())
