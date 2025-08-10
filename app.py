@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 # ---------- Third-party deps ----------
 # pip install:
 # python-telegram-bot, SQLAlchemy, psycopg[binary], pandas, numpy, statsmodels, scikit-learn,
-# feedparser, beautifulsoup4, httpx, tenacity, python-dateutil, robotexclusionrulesparser, uvloop (non-windows)
+# feedparser, beautifulsoup4, cloudscraper, tenacity, python-dateutil, robotexclusionrulesparser, uvloop (non-windows)
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -17,22 +17,37 @@ from telegram import Update
 
 # Collectors deps
 import feedparser
-import httpx
+import cloudscraper
 from bs4 import BeautifulSoup
 from dateutil import parser as dtp
 
 # ---------- Settings ----------
 class Settings(BaseModel):
-    telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "8355867886:AAGtV1075TBOraHtghFVQGXaEQtlclXCXCg")
-    database_url: str = os.getenv("DATABASE_URL", "")
+    telegram_token: str = os.getenv(
+        "TELEGRAM_BOT_TOKEN",
+        "8355867886:AAGtV1075TBOraHtghFVQGXaEQtlclXCXCg",
+    )
+    # Fall back to a local SQLite file so the project can run without any
+    # external database configuration.  An environment variable can still be
+    # provided to point at a PostgreSQL instance, but it is no longer
+    # required.
+    database_url: str = os.getenv(
+        "DATABASE_URL",
+        f"sqlite:///{os.path.abspath('proballers.db')}",
+    )
     app_env: str = os.getenv("APP_ENV", "dev")
 
 settings = Settings()
-if not settings.database_url:
-    print("WARNING: DATABASE_URL not set — set before running migrate/bot.", file=sys.stderr)
+# Single shared session to bypass Cloudflare-protected sites when gathering data.
+scraper = cloudscraper.create_scraper()
+if settings.database_url.startswith("sqlite:///"):
+    print(
+        f"Using local SQLite database at {settings.database_url.split('///', 1)[1]}",
+        file=sys.stderr,
+    )
 
 # ---------- DB ----------
-engine = create_engine(settings.database_url or "sqlite://", pool_pre_ping=True, future=True)
+engine = create_engine(settings.database_url, pool_pre_ping=True, future=True)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
 
 # ---------- SQL Migrations (embedded) ----------
@@ -139,8 +154,6 @@ CREATE INDEX IF NOT EXISTS idx_news_time ON news_2025(published_at);
 }
 
 def run_migrations():
-    if not settings.database_url:
-        raise RuntimeError("DATABASE_URL is required to run migrations.")
     with engine.begin() as conn:
         for name in sorted(MIGRATIONS.keys()):
             sql = MIGRATIONS[name]
@@ -200,7 +213,7 @@ NFL_NEWS_INDEX   = "https://www.nfl.com/news/"
 
 def parse_nfl_injuries():
     try:
-        resp = httpx.get(NFL_INJURIES_URL, timeout=20)
+        resp = scraper.get(NFL_INJURIES_URL, timeout=20)
         resp.raise_for_status()
     except Exception:
         return 0
@@ -224,7 +237,7 @@ def parse_nfl_injuries():
 
 def parse_nfl_news():
     try:
-        r = httpx.get(NFL_NEWS_INDEX, timeout=20)
+        r = scraper.get(NFL_NEWS_INDEX, timeout=20)
         r.raise_for_status()
     except Exception:
         return 0
@@ -646,15 +659,13 @@ def main():
         return
 
     if cmd == "refresh":
-        if not settings.database_url:
-            raise RuntimeError("DATABASE_URL required.")
         n = refresh_all()
         print(f"Refresh complete. {n} recommendations updated.")
         return
 
     if cmd == "bot":
-        if not settings.telegram_token or not settings.database_url:
-            raise RuntimeError("Set TELEGRAM_BOT_TOKEN and DATABASE_URL before running the bot.")
+        if not settings.telegram_token:
+            raise RuntimeError("Set TELEGRAM_BOT_TOKEN before running the bot.")
         async def runner():
             app = await build_app(settings.telegram_token)
             await app.initialize()
