@@ -7,7 +7,7 @@ statsmodels
 scikit-learn
 feedparser
 beautifulsoup4
-httpx
+cloudscraper
 tenacity
 python-dateutil
 robotexclusionrulesparser
