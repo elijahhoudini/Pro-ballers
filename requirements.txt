@@ -12,3 +12,4 @@ tenacity
 python-dateutil
 robotexclusionrulesparser
 uvloop; platform_system != 'Windows'
+pydantic
